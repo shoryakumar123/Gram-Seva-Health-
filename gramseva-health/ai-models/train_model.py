@@ -7,9 +7,13 @@ and comprehensive metrics export.
 Dataset: 132 binary symptom features → 41 disease classes
 Model:   RandomForestClassifier (300 trees)
 
-Run:  python train_model.py
+Run:
+    python train_model.py --dataset-dir /path/to/ml_training_dir
+    # or set the GRAMSEVA_DATASET_DIR environment variable instead of --dataset-dir
+    # (the directory must contain Training.csv and Testing.csv)
 """
 
+import argparse
 import pandas as pd
 import numpy as np
 import joblib
@@ -18,12 +22,42 @@ import os
 import sys
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import cross_val_score
 
 # ─── PATHS ────────────────────────────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), "ml training")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_dataset_dir() -> str:
+    """
+    Resolve the directory containing Training.csv / Testing.csv from
+    (in priority order):
+      1. --dataset-dir CLI argument
+      2. GRAMSEVA_DATASET_DIR environment variable
+      3. ../../ml training relative to this script (original fallback default)
+    """
+    parser = argparse.ArgumentParser(description="Train GramSeva triage RandomForest model")
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=None,
+        help="Path to the directory containing Training.csv and Testing.csv "
+             "(overrides GRAMSEVA_DATASET_DIR env var)",
+    )
+    args, _ = parser.parse_known_args()
+
+    if args.dataset_dir:
+        return os.path.abspath(args.dataset_dir)
+
+    env_dir = os.environ.get("GRAMSEVA_DATASET_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    return os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), "ml training")
+
+
+DATA_DIR   = resolve_dataset_dir()
 TRAIN_CSV  = os.path.join(DATA_DIR, "Training.csv")
 TEST_CSV   = os.path.join(DATA_DIR, "Testing.csv")
 
@@ -38,6 +72,8 @@ METRICS_OUT     = os.path.join(BASE_DIR, "model_metrics.json")
 for path, name in [(TRAIN_CSV, "Training.csv"), (TEST_CSV, "Testing.csv")]:
     if not os.path.exists(path):
         print(f"❌ ERROR: {name} not found at {path}")
+        print("   Pass --dataset-dir, or set GRAMSEVA_DATASET_DIR, to point at the "
+              "directory containing Training.csv and Testing.csv.")
         sys.exit(1)
 
 # ─── LOAD DATA ────────────────────────────────────────────────────────────────
@@ -72,6 +108,54 @@ X_test  = test.drop("prognosis", axis=1)
 y_test  = test["prognosis"]
 
 SYMPTOM_COLUMNS = list(X_train.columns)
+
+# ─── DIAGNOSTIC: DUPLICATE / TRAIN-TEST OVERLAP CHECK ────────────────────────
+# A perfect (or near-perfect) test accuracy combined with zero CV variance is a
+# classic symptom of leakage. There are two distinct ways it can happen here:
+#   1. Training.csv itself contains many exact-duplicate rows per disease, so a
+#      CV fold split can put a row's twin in the training half and the
+#      original in the validation half of the *same* fold.
+#   2. Testing.csv's "held-out" rows are themselves duplicates of rows already
+#      present in Training.csv, so the model has already seen them.
+# Both are checked explicitly below rather than assumed.
+print("\n🔍 Diagnostic: checking for duplication and train/test overlap...")
+
+train_full = pd.concat([X_train, y_train], axis=1)
+test_full  = pd.concat([X_test, y_test], axis=1)
+
+n_train_total = len(train_full)
+n_train_dupes = int(train_full.duplicated().sum())
+n_train_unique = int(train_full.drop_duplicates().shape[0])
+print(f"   Training.csv total rows        : {n_train_total}")
+print(f"   Training.csv duplicate rows    : {n_train_dupes}  ({n_train_dupes / n_train_total:.1%} of total)")
+print(f"   Training.csv unique combos     : {n_train_unique}")
+
+print("\n   Unique symptom-combinations per disease (Training.csv):")
+per_disease_unique = train_full.groupby("prognosis").apply(lambda g: g.drop_duplicates().shape[0])
+for disease, n_unique in per_disease_unique.sort_values().items():
+    total_for_disease = (train_full["prognosis"] == disease).sum()
+    print(f"     {disease:<45s} {n_unique:>4d} unique / {total_for_disease:>4d} total rows")
+
+train_row_set = set(map(tuple, train_full.values.tolist()))
+test_row_set  = set(map(tuple, test_full.values.tolist()))
+overlap = train_row_set & test_row_set
+n_overlap = len(overlap)
+print(f"\n   Testing.csv rows also present in Training.csv: {n_overlap} / {len(test_row_set)}")
+
+if n_train_dupes / n_train_total > 0.5:
+    print(
+        "\n   ⚠️  Over half of Training.csv rows are exact duplicates. Any CV split on "
+        "this data risks a row's duplicate landing in the opposite fold, inflating CV "
+        "accuracy independent of true generalization."
+    )
+if n_overlap > 0:
+    print(
+        f"\n   ⚠️  {n_overlap} of the {len(test_row_set)} 'held-out' Testing.csv rows are "
+        "identical to rows already in Training.csv. Test accuracy on those rows reflects "
+        "memorization, not generalization to unseen cases."
+    )
+if n_train_dupes / n_train_total <= 0.5 and n_overlap == 0:
+    print("\n   ✅ No major duplication or train/test overlap detected.")
 
 # ─── LABEL ENCODE ─────────────────────────────────────────────────────────────
 le = LabelEncoder()
@@ -222,6 +306,9 @@ metrics = {
     "n_symptoms": len(SYMPTOM_COLUMNS),
     "n_train_samples": int(X_train.shape[0]),
     "n_test_samples": int(X_test.shape[0]),
+    "n_train_duplicate_rows": n_train_dupes,
+    "n_train_unique_combinations": n_train_unique,
+    "n_test_rows_overlapping_train": n_overlap,
     "model_params": {
         "n_estimators": 300,
         "max_depth": 20,
