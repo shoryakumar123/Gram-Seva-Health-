@@ -8,7 +8,8 @@ Expected acc : 70–85 %  (vs. ≈46 % for PCA+RandomForest)
 
 Usage:
     source .venv/bin/activate
-    python train_cnn_model.py
+    python train_cnn_model.py --dataset-dir /path/to/dataset
+    # or set the GRAMSEVA_DATASET_DIR environment variable instead of --dataset-dir
 
 Outputs (in same directory):
     skin_cnn.pt              TorchScript model ready for direct inference
@@ -17,6 +18,7 @@ Outputs (in same directory):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -44,8 +46,37 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s", str
 log = logging.getLogger("gramseva.cnn")
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-DATASET_DIR = "/Users/ayushkumarsahu/Desktop/bday/ml training"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_dataset_dir() -> str:
+    """
+    Resolve the dataset directory from (in priority order):
+      1. --dataset-dir CLI argument
+      2. GRAMSEVA_DATASET_DIR environment variable
+      3. ./dataset relative to this script (fallback default)
+    """
+    parser = argparse.ArgumentParser(description="Train GramSeva skin-disease CNN")
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=None,
+        help="Path to the ImageFolder-style dataset directory "
+             "(overrides GRAMSEVA_DATASET_DIR env var)",
+    )
+    args, _ = parser.parse_known_args()
+
+    if args.dataset_dir:
+        return os.path.abspath(args.dataset_dir)
+
+    env_dir = os.environ.get("GRAMSEVA_DATASET_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    return os.path.join(BASE_DIR, "dataset")
+
+
+DATASET_DIR = resolve_dataset_dir()
 
 IMG_SIZE     = 224        # MobileNetV2 standard
 BATCH_SIZE   = 32
@@ -242,6 +273,11 @@ def main():
         if epoch == UNFREEZE_EPOCH and not backbone_unfrozen:
             unfreeze_backbone(model, LR_BACKBONE, optimizer)
             backbone_unfrozen = True
+            # Recreate the scheduler now that the backbone param group exists,
+            # so its LR is included in the cosine annealing schedule instead
+            # of staying pinned at LR_BACKBONE for the rest of training.
+            remaining_epochs = EPOCHS - epoch + 1
+            scheduler = CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=1e-6)
 
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
         val_loss,   val_acc   = eval_epoch(model, val_loader, criterion)
