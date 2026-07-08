@@ -7,7 +7,8 @@ Pipeline: Images → Feature extraction → PCA → RandomForest
 Usage:
     # Activate the virtual environment first:
     source .venv/bin/activate
-    python train_skin_model.py
+    python train_skin_model.py --dataset-dir /path/to/dataset
+    # or set the GRAMSEVA_DATASET_DIR environment variable instead of --dataset-dir
 
 Requirements:
     pip install -r requirements.txt
@@ -16,6 +17,7 @@ Requirements:
 
 from __future__ import annotations  # enables tuple[...] syntax on Python < 3.10
 
+import argparse
 import json
 import logging
 import os
@@ -70,8 +72,37 @@ logging.basicConfig(
 log = logging.getLogger("gramseva.train")
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-DATASET_DIR = "/Users/ayushkumarsahu/Desktop/bday/ml training"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_dataset_dir() -> str:
+    """
+    Resolve the dataset directory from (in priority order):
+      1. --dataset-dir CLI argument
+      2. GRAMSEVA_DATASET_DIR environment variable
+      3. ./dataset relative to this script (fallback default)
+    """
+    parser = argparse.ArgumentParser(description="Train GramSeva skin-disease PCA+RandomForest model")
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=None,
+        help="Path to the class-subfolder dataset directory "
+             "(overrides GRAMSEVA_DATASET_DIR env var)",
+    )
+    args, _ = parser.parse_known_args()
+
+    if args.dataset_dir:
+        return os.path.abspath(args.dataset_dir)
+
+    env_dir = os.environ.get("GRAMSEVA_DATASET_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    return os.path.join(BASE_DIR, "dataset")
+
+
+DATASET_DIR = resolve_dataset_dir()
 
 IMG_SIZE     = 128   # Resize all images to IMG_SIZE × IMG_SIZE
 HIST_BINS    = 16    # Colour histogram bins per channel
@@ -140,7 +171,8 @@ def load_dataset(dataset_dir: str) -> tuple[np.ndarray, np.ndarray]:
     if not os.path.isdir(dataset_dir):
         raise FileNotFoundError(
             f"Dataset directory not found: {dataset_dir}\n"
-            "Please check DATASET_DIR in the config section."
+            "Please check DATASET_DIR in the config section, pass --dataset-dir, "
+            "or set the GRAMSEVA_DATASET_DIR environment variable."
         )
 
     X: list[list[float]] = []
@@ -338,4 +370,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
